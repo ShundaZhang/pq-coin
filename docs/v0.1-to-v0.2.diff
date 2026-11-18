@@ -1,0 +1,496 @@
+--- v0.1/pqc_chain.py
++++ v0.2/pqc_v2.py
+@@ -2 +2 @@
+-"""Local, single-producer blockchain demo. Standard library + OpenSSL."""
++"""Local proof-of-work PQC chain with a built-in programmable escrow template."""
+@@ -4,0 +5 @@
++from dataclasses import dataclass, field
+@@ -16,0 +18,2 @@
++COIN_NAME = "PQ币"
++COIN_SYMBOL = "PQ"
+@@ -19,2 +22,5 @@
+-MAX_NONCE = (1 << 64) - 1
+-VERSION = "pqcchain-v1"
++MAX_U64 = (1 << 64) - 1
++VERSION = "pqcchain-v2"
++MIN_BITS = 8
++MAX_BITS = 22
++MAX_TTL = 4096
+@@ -44 +50 @@
+-    return b"pqcchain-v1/" + domain.encode("ascii") + b"\x00" + canonical(value)
++    return VERSION.encode("ascii") + b"/" + domain.encode("ascii") + b"\x00" + canonical(value)
+@@ -65,0 +72 @@
++    # Keep v1 address encoding so existing test wallet PEMs can be reused.
+@@ -165,4 +172,2 @@
+-def make_genesis(treasury, producer):
+-    check_address(treasury)
+-    return {"version": VERSION, "network_tag": secrets.token_hex(16), "supply": SUPPLY,
+-            "treasury": treasury, "producer_key": producer.hex()}
++def emit(value):
++    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+@@ -171 +176,95 @@
+-def apply_tx(tx, chain_id, balances, nonces):
++def normalize_hash(value, label):
++    if value is None:
++        return None
++    value = value.removeprefix("0x")
++    hex_bytes(value, 32, label)
++    return value
++
++
++def contract_address(chain_id, sender, nonce):
++    return "pc1" + digest("contract-id", [chain_id, sender, nonce])
++
++
++def check_contract(value):
++    require(type(value) is str and value.startswith("pc1"), "合约地址格式错误")
++    hex_bytes(value[3:], 32, "合约地址")
++
++
++def credit(balances, receiver, amount):
++    balances[receiver] = balances.get(receiver, 0) + amount
++
++
++def debit(balances, sender, amount):
++    require(balances.get(sender, 0) >= amount, "余额不足（含手续费）")
++    balances[sender] -= amount
++
++
++@dataclass(frozen=True)
++class Escrow:
++    sender: str
++    beneficiary: str
++    hashlock: str
++    expires_height: int
++    amount: int
++    status: str = "open"
++
++    @property
++    def locked(self):
++        return self.amount if self.status == "open" else 0
++
++
++@dataclass
++class Ledger:
++    balances: dict = field(default_factory=dict)
++    nonces: dict = field(default_factory=dict)
++    contracts: dict = field(default_factory=dict)
++
++    def copy(self):
++        # Escrow records are immutable; copies need not clone their values.
++        return Ledger(self.balances.copy(), self.nonces.copy(), self.contracts.copy())
++
++    def total(self):
++        return sum(self.balances.values()) + sum(c.locked for c in self.contracts.values())
++
++
++@dataclass
++class Replay:
++    genesis_hash: str
++    bits: int
++    hashes: list
++    confirmed: Ledger
++    projected: Ledger
++    pending_fees: int
++
++    @property
++    def tip(self):
++        return self.hashes[-1]
++
++    @property
++    def height(self):
++        return len(self.hashes) - 1
++
++
++def tx_data(kind, data):
++    if kind == "transfer":
++        fields(data, "to amount", "转账")
++        check_address(data["to"])
++        integer(data["amount"], 1, SUPPLY, "金额")
++    elif kind == "escrow-deploy":
++        fields(data, "beneficiary amount hashlock ttl", "部署")
++        check_address(data["beneficiary"])
++        integer(data["amount"], 2, SUPPLY, "锁定金额")
++        hex_bytes(data["hashlock"], 32, "SHA-256 哈希锁")
++        integer(data["ttl"], 2, MAX_TTL, "有效区块数")
++    elif kind == "escrow-claim":
++        fields(data, "contract secret", "领取")
++        check_contract(data["contract"])
++        hex_bytes(data["secret"], 32, "原像")
++    elif kind == "escrow-refund":
++        fields(data, "contract", "退款")
++        check_contract(data["contract"])
++    else:
++        raise ChainError("未知交易类型")
++
++
++def apply_tx(tx, chain_id, height, ledger):
+@@ -174,3 +273,3 @@
+-    fields(body, "chain_id from to amount nonce", "交易正文")
+-    require(body["chain_id"] == chain_id, "交易 chain_id 与本链不匹配")
+-    sender, recipient, amount, nonce = (body[key] for key in ("from", "to", "amount", "nonce"))
++    fields(body, "chain_id from nonce fee kind data", "交易正文")
++    require(body["chain_id"] == chain_id, "交易 chain_id 与本链不匹配")
++    sender, nonce, fee, kind, data = (body[k] for k in ("from", "nonce", "fee", "kind", "data"))
+@@ -178,13 +277,9 @@
+-    check_address(recipient)
+-    integer(amount, 1, SUPPLY, "金额")
+-    integer(nonce, 0, MAX_NONCE, "nonce")
+-    raw_key = hex_bytes(tx["public_key"], PUB_BYTES, "交易公钥")
+-    sig = hex_bytes(tx["signature"], SIG_BYTES, "交易签名")
+-    require(address(raw_key) == sender, "签名公钥与发送者地址不匹配")
+-    expected = nonces.get(sender, 0)
+-    require(nonce == expected, f"nonce 不匹配：预期 {expected}，收到 {nonce}")
+-    require(balances.get(sender, 0) >= amount, "余额不足")
+-    verify_signature(raw_key, sig, "tx", body)
+-    balances[sender] -= amount
+-    balances[recipient] = balances.get(recipient, 0) + amount
+-    nonces[sender] = nonce + 1
++    integer(nonce, 0, MAX_U64, "nonce")
++    integer(fee, 1, SUPPLY, "手续费")
++    tx_data(kind, data)
++    public = hex_bytes(tx["public_key"], PUB_BYTES, "公钥")
++    signature = hex_bytes(tx["signature"], SIG_BYTES, "签名")
++    require(address(public) == sender, "签名公钥与发送者地址不匹配")
++    expect = ledger.nonces.get(sender, 0)
++    require(nonce == expect, f"nonce 不匹配：预期 {expect}，收到 {nonce}")
++    verify_signature(public, signature, "tx", body)
+@@ -191,0 +287,31 @@
++    if kind == "transfer":
++        debit(ledger.balances, sender, data["amount"] + fee)
++        credit(ledger.balances, data["to"], data["amount"])
++    elif kind == "escrow-deploy":
++        identifier = contract_address(chain_id, sender, nonce)
++        require(identifier not in ledger.contracts, "合约已存在")
++        require(height + data["ttl"] <= MAX_U64, "合约过期高度溢出")
++        debit(ledger.balances, sender, data["amount"] + fee)
++        ledger.contracts[identifier] = Escrow(sender, data["beneficiary"], data["hashlock"],
++                                              height + data["ttl"], data["amount"])
++    else:
++        identifier = data["contract"]
++        escrow = ledger.contracts.get(identifier)
++        require(escrow is not None, "合约不存在")
++        require(escrow.status == "open", "合约已结算")
++        require(fee < escrow.amount, "手续费必须小于合约锁定金额")
++        if kind == "escrow-claim":
++            require(sender == escrow.beneficiary, "只有指定受益人能领取")
++            require(height < escrow.expires_height, "合约已到期")
++            require(hashlib.sha256(bytes.fromhex(data["secret"])).hexdigest() == escrow.hashlock,
++                    "合约原像不匹配")
++            status = "claimed"
++        else:
++            require(sender == escrow.sender, "只有部署者能退款")
++            require(height >= escrow.expires_height, "合约尚未到期")
++            status = "refunded"
++        credit(ledger.balances, sender, escrow.amount - fee)
++        ledger.contracts[identifier] = Escrow(escrow.sender, escrow.beneficiary, escrow.hashlock,
++                                              escrow.expires_height, escrow.amount, status)
++    ledger.nonces[sender] = nonce + 1
++    return fee
+@@ -193,6 +319,13 @@
+-def validate(state, pinned_genesis=None):
+-    """Rebuild balances by replay; the pending pool is validated separately."""
+-    fields(state, "genesis blocks pending", "链文件")
+-    genesis = state["genesis"]
+-    fields(genesis, "version network_tag supply treasury producer_key", "创世区块")
+-    require(genesis["version"] == VERSION, "不支持的链版本")
++
++def pow_id(header):
++    return digest("pow", header)
++
++
++def work_meets_target(block_hash, bits):
++    return int(block_hash, 16) < 1 << (256 - bits)
++
++
++def inspect_genesis(genesis, pinned):
++    require(type(genesis) is dict and genesis.get("version") == VERSION,
++            "不支持的链版本；v0.2 需新创世，不能直接打开 v0.1 账本")
++    fields(genesis, "version network_tag supply treasury difficulty_bits", "创世区块")
+@@ -202 +335,2 @@
+-    producer_key = hex_bytes(genesis["producer_key"], PUB_BYTES, "创世出块者公钥")
++    bits = genesis["difficulty_bits"]
++    integer(bits, MIN_BITS, MAX_BITS, "难度位数")
+@@ -204,7 +338,13 @@
+-    if pinned_genesis is not None:
+-        hex_bytes(pinned_genesis, 32, "创世锚点")
+-        require(pinned_genesis == chain_id, "创世锚点不匹配")
+-    blocks, pending = state["blocks"], state["pending"]
+-    require(type(blocks) is list, "区块列表格式错误")
+-    require(type(pending) is list and len(pending) <= MAX_TX, "待打包列表格式错误或超长")
+-    balances, nonces, tip = {genesis["treasury"]: SUPPLY}, {}, chain_id
++    if pinned is not None:
++        require(pinned == chain_id, "创世锚点不匹配")
++    return chain_id, bits
++
++
++def replay(state, pinned=None):
++    fields(state, "genesis blocks pending", "链文件")
++    genesis, blocks, pending = (state[k] for k in ("genesis", "blocks", "pending"))
++    chain_id, bits = inspect_genesis(genesis, pinned)
++    require(type(blocks) is list and len(blocks) < MAX_U64, "区块列表格式错误")
++    require(type(pending) is list and len(pending) <= MAX_TX, "待打包队列格式错误或超长")
++    ledger = Ledger({genesis["treasury"]: SUPPLY})
++    hashes = [chain_id]
+@@ -213,12 +353,20 @@
+-            fields(block, "body signature", "区块")
+-            body = block["body"]
+-            fields(body, "height prev transactions", "区块正文")
+-            integer(body["height"], height, height, "区块高度")
+-            require(body["prev"] == tip, "前块哈希不匹配")
+-            txs = body["transactions"]
+-            require(type(txs) is list and 1 <= len(txs) <= MAX_TX, "区块交易数不合法")
+-            verify_signature(producer_key, hex_bytes(block["signature"], SIG_BYTES, "区块签名"),
+-                             "block", body)
+-            for tx in txs:
+-                apply_tx(tx, chain_id, balances, nonces)
+-            tip = digest("block-id", block)
++            fields(block, "header transactions miner_key signature", "区块")
++            header, txs = block["header"], block["transactions"]
++            fields(header, "chain_id height prev tx_commitment miner work_nonce", "区块头")
++            require(header["chain_id"] == chain_id, "区块 chain_id 与本链不匹配")
++            integer(header["height"], height, height, "区块高度")
++            require(header["prev"] == hashes[-1], "前块哈希不匹配")
++            require(type(txs) is list and len(txs) <= MAX_TX, "区块交易数不合法")
++            require(header["tx_commitment"] == digest("transactions", txs), "区块交易承诺不匹配")
++            integer(header["work_nonce"], 0, MAX_U64, "工作量 nonce")
++            check_address(header["miner"])
++            block_hash = pow_id(header)
++            require(work_meets_target(block_hash, bits), "PoW 不满足创世难度")
++            public = hex_bytes(block["miner_key"], PUB_BYTES, "矿工公钥")
++            require(address(public) == header["miner"], "矿工公钥与地址不匹配")
++            sig = hex_bytes(block["signature"], SIG_BYTES, "区块签名")
++            verify_signature(public, sig, "block", header)
++            fees = sum(apply_tx(tx, chain_id, height, ledger) for tx in txs)
++            credit(ledger.balances, header["miner"], fees)
++            require(ledger.total() == SUPPLY, "余额加合约锁仓不等于固定发行量")
++            hashes.append(block_hash)
+@@ -227,2 +375,3 @@
+-    require(sum(balances.values()) == SUPPLY, "已确认余额之和不等于固定发行量")
+-    pending_balances, pending_nonces = balances.copy(), nonces.copy()
++
++    projected = ledger.copy()
++    fees = 0
+@@ -231 +380 @@
+-            apply_tx(tx, chain_id, pending_balances, pending_nonces)
++            fees += apply_tx(tx, chain_id, len(hashes), projected)
+@@ -234,2 +383,2 @@
+-    require(sum(pending_balances.values()) == SUPPLY, "待打包余额之和不等于固定发行量")
+-    return chain_id, tip, balances, nonces, pending_balances, pending_nonces
++    require(projected.total() + fees == SUPPLY, "预计余额、锁仓和待结算手续费总量错误")
++    return Replay(chain_id, bits, hashes, ledger, projected, fees)
+@@ -238,2 +387,21 @@
+-def emit(value):
+-    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
++def mine(state, rt, wallet, start, count, allow_empty):
++    require(state["pending"] or allow_empty, "无待打包交易；若需要空块请显式加 --allow-empty")
++    integer(start, 0, MAX_U64, "起始工作量 nonce")
++    integer(count, 1, 10_000_000, "尝试上限")
++    public = public_key(wallet)
++    txs = state["pending"]
++    header = {"chain_id": rt.genesis_hash, "height": rt.height + 1, "prev": rt.tip,
++              "tx_commitment": digest("transactions", txs), "miner": address(public)}
++    for n in range(start, min(MAX_U64 + 1, start + count)):
++        header["work_nonce"] = n
++        if work_meets_target(pow_id(header), rt.bits):
++            break
++    else:
++        raise ChainError("本次未找到工作量证明；账本未改动，可用 --start-nonce 继续试")
++    state["blocks"].append({"header": header, "transactions": txs, "miner_key": public.hex(),
++                            "signature": sign(wallet, "block", header)})
++    state["pending"] = []
++    new_rt = replay(state, rt.genesis_hash)
++    return {"height": new_rt.height, "block_hash": new_rt.tip, "miner": header["miner"],
++            "attempts": n - start + 1, "work_nonce": n, "difficulty_bits": rt.bits,
++            "transactions": len(txs), "fees_to_miner": rt.pending_fees, "minted": 0}
+@@ -241,0 +410,22 @@
++def sign_tx(args, rt):
++    wallet = args.wallet.resolve()
++    public = public_key(wallet)
++    sender = address(public)
++    nonce = rt.projected.nonces.get(sender, 0)
++    if args.intent == "transfer":
++        data = {"to": args.to, "amount": args.amount}
++    elif args.intent == "escrow-deploy":
++        data = {"beneficiary": args.beneficiary, "amount": args.amount,
++                "hashlock": args.hashlock, "ttl": args.ttl}
++    elif args.intent == "escrow-claim":
++        data = {"contract": args.contract, "secret": args.secret}
++    else:
++        data = {"contract": args.contract}
++    tx_data(args.intent, data)
++    integer(nonce, 0, MAX_U64, "nonce")
++    integer(args.fee, 1, SUPPLY, "手续费")
++    body = {"chain_id": rt.genesis_hash, "from": sender, "nonce": nonce, "fee": args.fee,
++            "kind": args.intent, "data": data}
++    return {"body": body, "public_key": public.hex(), "signature": sign(wallet, "tx", body)}
++
++
+@@ -243,2 +433,3 @@
+-    parser = argparse.ArgumentParser(description="本地单节点 PQC 链（仅教学用途）")
+-    parser.add_argument("--chain", type=Path, default=Path("chain.json"), help="链 JSON 文件")
++    parser = argparse.ArgumentParser(description=f"{COIN_NAME}（{COIN_SYMBOL}）v0.2 本地教学链")
++    parser.add_argument("--chain", type=Path, default=Path("chain-v2.json"))
++    parser.add_argument("--genesis", help="独立保存的创世哈希；可带 0x")
+@@ -246,5 +437,3 @@
+-    wallet = sub.add_parser("wallet-new", help="生成未加密的 ML-DSA-44 PEM 私钥，输出地址")
+-    wallet.add_argument("wallet", type=Path)
+-    show = sub.add_parser("address", help="从钱包读取地址")
+-    show.add_argument("wallet", type=Path)
+-    init = sub.add_parser("init", help="创建创世区块并固定总量")
++    sub.add_parser("wallet-new").add_argument("wallet", type=Path)
++    sub.add_parser("address").add_argument("wallet", type=Path)
++    init = sub.add_parser("init")
+@@ -252,14 +441,29 @@
+-    init.add_argument("--producer", type=Path, required=True)
+-    tx = sub.add_parser("sign", help="签名转账，输出交易 JSON（不改账本）")
+-    tx.add_argument("--wallet", type=Path, required=True)
+-    tx.add_argument("--to", required=True)
+-    tx.add_argument("--amount", type=int, required=True)
+-    tx.add_argument("--genesis", help="校验独立保存的创世哈希")
+-    submit = sub.add_parser("submit", help="验签并将交易加入待打包队列")
+-    submit.add_argument("tx", type=Path)
+-    produce = sub.add_parser("produce", help="用指定的出块钱包打包待确认交易")
+-    produce.add_argument("--producer", type=Path, required=True)
+-    balance = sub.add_parser("balance", help="显示已确认余额和待打包后的预计余额")
+-    balance.add_argument("address")
+-    verify = sub.add_parser("verify", help="从创世区块验链并重算余额")
+-    verify.add_argument("--genesis", help="校验独立保存的创世哈希")
++    init.add_argument("--bits", type=int, default=12, help="创世 PoW 难度：8 到 22 位")
++    tr = sub.add_parser("sign", help="只签名；用 submit 入队")
++    tr.add_argument("--wallet", required=True, type=Path)
++    tr.add_argument("--fee", default=1, type=int)
++    intent = tr.add_subparsers(dest="intent", required=True)
++    xfer = intent.add_parser("transfer")
++    xfer.add_argument("--to", required=True)
++    xfer.add_argument("--amount", type=int, required=True)
++    dep = intent.add_parser("escrow-deploy")
++    dep.add_argument("--beneficiary", required=True)
++    dep.add_argument("--amount", required=True, type=int)
++    dep.add_argument("--hashlock", required=True)
++    dep.add_argument("--ttl", default=4, type=int)
++    claim = intent.add_parser("escrow-claim")
++    claim.add_argument("contract")
++    claim.add_argument("--secret", required=True)
++    intent.add_parser("escrow-refund").add_argument("contract")
++    sub.add_parser("submit").add_argument("tx", type=Path)
++    mining = sub.add_parser("mine")
++    mining.add_argument("--wallet", required=True, type=Path)
++    mining.add_argument("--start-nonce", type=int, default=0)
++    mining.add_argument("--max-attempts", type=int, default=1_000_000)
++    mining.add_argument("--allow-empty", action="store_true")
++    sub.add_parser("balance").add_argument("address")
++    sub.add_parser("contract").add_argument("address")
++    sub.add_parser("verify")
++    checkpoint = sub.add_parser("checkpoint", help="验链并导出 Sepolia 检查点")
++    checkpoint.add_argument("--height", type=int)
++    checkpoint.add_argument("--expect", help="可信合约读到的哈希；需同时指定高度和创世")
+@@ -275,0 +480 @@
++    pinned = normalize_hash(args.genesis, "创世锚点")
+@@ -277,0 +483 @@
++            require(pinned is None, "初始化新链时不指定旧创世哈希")
+@@ -279 +485,2 @@
+-            genesis = make_genesis(args.treasury, public_key(args.producer.resolve()))
++            genesis = {"version": VERSION, "network_tag": secrets.token_hex(16), "supply": SUPPLY,
++                       "treasury": args.treasury, "difficulty_bits": args.bits}
+@@ -281 +488 @@
+-            chain_id = validate(state)[0]
++            rt = replay(state)
+@@ -283 +490,3 @@
+-            emit({"genesis_hash": chain_id, "total_supply": SUPPLY, "treasury": args.treasury})
++            emit({"coin_name": COIN_NAME, "symbol": COIN_SYMBOL,
++                  "genesis_hash": rt.genesis_hash, "total_supply": SUPPLY,
++                  "treasury": args.treasury, "difficulty_bits": rt.bits})
+@@ -287,2 +496 @@
+-        chain_id, tip, balances, nonces, pending_balances, pending_nonces = validate(
+-            state, getattr(args, "genesis", None))
++        rt = replay(state, pinned)
+@@ -290,10 +498 @@
+-            check_address(args.to)
+-            integer(args.amount, 1, SUPPLY, "金额")
+-            wallet = args.wallet.resolve()
+-            public = public_key(wallet)
+-            sender = address(public)
+-            nonce = pending_nonces.get(sender, 0)
+-            integer(nonce, 0, MAX_NONCE, "nonce")
+-            body = {"from": sender, "to": args.to, "amount": args.amount, "nonce": nonce,
+-                    "chain_id": chain_id}
+-            emit({"body": body, "public_key": public.hex(), "signature": sign(wallet, "tx", body)})
++            emit(sign_tx(args, rt))
+@@ -303 +502,2 @@
+-            apply_tx(tx, chain_id, pending_balances, pending_nonces)
++            fee = apply_tx(tx, rt.genesis_hash, rt.height + 1, rt.projected)
++            require(rt.projected.total() + rt.pending_fees + fee == SUPPLY, "手续费结算不守恒")
+@@ -306,12 +506,8 @@
+-            emit({"txid": digest("tx-id", tx), "pending": len(state["pending"])})
+-        elif args.command == "produce":
+-            require(state["pending"], "无待打包交易")
+-            wallet = args.producer.resolve()
+-            require(public_key(wallet).hex() == state["genesis"]["producer_key"],
+-                    "这个钱包不是创世区块指定的出块者")
+-            body = {"height": len(state["blocks"]) + 1, "prev": tip,
+-                    "transactions": state["pending"]}
+-            block = {"body": body, "signature": sign(wallet, "block", body)}
+-            state["blocks"].append(block)
+-            state["pending"] = []
+-            _, new_tip, *_ = validate(state, chain_id)
++            receipt = {"txid": digest("tx-id", tx), "pending": len(state["pending"])}
++            if tx["body"]["kind"] == "escrow-deploy":
++                receipt["contract"] = contract_address(rt.genesis_hash, tx["body"]["from"],
++                                                       tx["body"]["nonce"])
++            emit(receipt)
++        elif args.command == "mine":
++            receipt = mine(state, rt, args.wallet.resolve(), args.start_nonce,
++                           args.max_attempts, args.allow_empty)
+@@ -319,2 +515 @@
+-            emit({"height": body["height"], "block_hash": new_tip,
+-                  "transactions": len(body["transactions"])})
++            emit(receipt)
+@@ -323,4 +518,28 @@
+-            emit({"address": args.address, "confirmed": balances.get(args.address, 0),
+-                  "including_pending": pending_balances.get(args.address, 0),
+-                  "next_nonce": nonces.get(args.address, 0),
+-                  "next_nonce_including_pending": pending_nonces.get(args.address, 0)})
++            a = args.address
++            emit({"address": a, "confirmed": rt.confirmed.balances.get(a, 0),
++                  "including_pending": rt.projected.balances.get(a, 0),
++                  "next_nonce": rt.confirmed.nonces.get(a, 0),
++                  "next_nonce_including_pending": rt.projected.nonces.get(a, 0)})
++        elif args.command == "contract":
++            check_contract(args.address)
++            a = args.address
++            def describe(ledger):
++                c = ledger.contracts.get(a)
++                return {**vars(c), "locked": c.locked} if c is not None else None
++            confirmed, pending = describe(rt.confirmed), describe(rt.projected)
++            require(confirmed is not None or pending is not None, "合约不存在")
++            emit({"address": a, "type": "hashlock-escrow", "confirmed": confirmed,
++                  "including_pending": pending})
++        elif args.command == "checkpoint":
++            expected = normalize_hash(args.expect, "链上区块哈希")
++            require(expected is None or (pinned is not None and args.height is not None),
++                    "--expect 必须与 --genesis 和 --height 一起使用")
++            h = rt.height if args.height is None else args.height
++            integer(h, 1, rt.height, "检查点高度（需先挖出区块）")
++            block_hash = rt.hashes[h]
++            require(expected is None or expected == block_hash, "本地区块哈希与链上记录不匹配")
++            result = {"genesisHash": "0x" + rt.genesis_hash, "height": h,
++                      "blockHash": "0x" + block_hash}
++            if expected is not None:
++                result["matches"] = True
++            emit(result)
+@@ -328,3 +547,7 @@
+-            emit({"valid": True, "genesis_hash": chain_id, "tip_hash": tip,
+-                  "genesis_pinned": args.genesis is not None, "height": len(state["blocks"]),
+-                  "pending": len(state["pending"]), "total_supply": sum(balances.values())})
++            emit({"valid": True, "coin_name": COIN_NAME, "symbol": COIN_SYMBOL,
++                  "genesis_hash": rt.genesis_hash, "genesis_pinned": pinned is not None,
++                  "tip_hash": rt.tip, "height": rt.height, "difficulty_bits": rt.bits,
++                  "pending": len(state["pending"]), "pending_fees": rt.pending_fees,
++                  "circulating": sum(rt.confirmed.balances.values()),
++                  "locked": sum(c.locked for c in rt.confirmed.contracts.values()),
++                  "contracts": len(rt.confirmed.contracts), "total_supply": rt.confirmed.total()})
+@@ -337,2 +560 @@
+-        print(f"错误: {exc}", file=sys.stderr)
+-        sys.exit(1)
++        sys.exit(f"错误: {exc}")

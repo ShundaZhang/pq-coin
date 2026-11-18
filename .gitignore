@@ -1,0 +1,26 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+node_modules/
+artifacts/
+cache/
+coverage/
+
+# Private keys, RPC secrets and generated demo state. Use a dedicated ignored run directory.
+*.pem
+*.key
+*.p12
+.env
+.env.*
+chain.json
+chain-v2.json
+*.json.lock
+genesis.json
+genesis-receipt.json
+tx.json
+escrow.json
+checkpoint*.json
+my-v2-run/
+runs/

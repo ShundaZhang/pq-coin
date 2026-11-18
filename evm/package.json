@@ -1,0 +1,14 @@
+{
+  "name": "pq-coin-evm",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "solc": "0.8.30",
+    "ethers": "6.15.0",
+    "hardhat": "3.0.6"
+  },
+  "version": "0.2.0",
+  "engines": {
+    "node": ">=24"
+  }
+}
